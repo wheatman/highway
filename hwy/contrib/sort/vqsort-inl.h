@@ -427,8 +427,9 @@ HWY_NOINLINE size_t Parallel_Partition(D d, Traits st, T *HWY_RESTRICT keys,
                                        size_t left, size_t right,
                                        const Vec<D> pivot,
                                        T *HWY_RESTRICT buf) {
-  // return Partition(d, st, keys, left, right, pivot, buf);
-  if (right - left <= 10000) {
+  return Partition(d, st, keys, left, right, pivot, buf);
+  #if false
+  if (right - left <= 100000) {
     return Partition(d, st, keys, left, right, pivot, buf);
   }
 
@@ -441,11 +442,58 @@ HWY_NOINLINE size_t Parallel_Partition(D d, Traits st, T *HWY_RESTRICT keys,
   cilk_sync;
   size_t new_middle = left_break + (right_break - middle);
   size_t flip_point = (left_break + right_break)/2;
-  cilk_for (size_t i = left_break; i < flip_point; i++) {
-    std::swap(keys[i], keys[right_break+left_break - i - 1]);
+  size_t flip_length = flip_point - left_break;
+  const size_t N = Lanes(d);
+  using V = decltype(Zero(d));
+  /*
+  size_t flip_length_aligned = (flip_length/N)*N;
+  cilk_for (size_t i = 0; i < flip_length_aligned; i += N) {
+    // std::swap(keys[left_break+i], keys[right_break - i - 1]);
+    const V vL = LoadU(d, keys + left_break + i);
+    const V rvL = Reverse(d, vL);
+    const V vR = LoadU(d, keys + right_break - i - N);
+    const V rvR = Reverse(d, vR);
+    StoreU(rvL, d, keys + right_break - i - N);
+    StoreU(rvR, d, keys + left_break + i);
+  }
+  */
+  
+  constexpr size_t unroll = 4;
+  size_t flip_length_aligned = (flip_length/(N*unroll))*(N*unroll);
+  cilk_for (size_t i = 0; i < flip_length_aligned; i += N*unroll) {
+    // std::swap(keys[left_break+i], keys[right_break - i - 1]);
+    const V vL1 = LoadU(d, keys + left_break + i + 0 * N);
+    const V vL2 = LoadU(d, keys + left_break + i + 1 * N);
+    const V vL3 = LoadU(d, keys + left_break + i + 2 * N);
+    const V vL4 = LoadU(d, keys + left_break + i + 3 * N);
+    const V rvL1 = Reverse(d, vL1);
+    const V rvL2 = Reverse(d, vL2);
+    const V rvL3 = Reverse(d, vL3);
+    const V rvL4 = Reverse(d, vL4);
+    const V vR1 = LoadU(d, keys + right_break - i - 1 * N);
+    const V vR2 = LoadU(d, keys + right_break - i - 2 * N);
+    const V vR3 = LoadU(d, keys + right_break - i - 3 * N);
+    const V vR4 = LoadU(d, keys + right_break - i - 4 * N);
+    const V rvR1 = Reverse(d, vR1);
+    const V rvR2 = Reverse(d, vR2);
+    const V rvR3 = Reverse(d, vR3);
+    const V rvR4 = Reverse(d, vR4);
+    StoreU(rvL1, d, keys + right_break - i - 1 * N);
+    StoreU(rvL2, d, keys + right_break - i - 2 * N);
+    StoreU(rvL3, d, keys + right_break - i - 3 * N);
+    StoreU(rvL4, d, keys + right_break - i - 4 * N);
+    StoreU(rvR1, d, keys + left_break + i + 0 * N);
+    StoreU(rvR2, d, keys + left_break + i + 1 * N);
+    StoreU(rvR3, d, keys + left_break + i + 2 * N);
+    StoreU(rvR4, d, keys + left_break + i + 3 * N);
+  }
+  
+  for (size_t i = flip_length_aligned; i < flip_length; i++) {
+    std::swap(keys[left_break+i], keys[right_break - i - 1]);
   }
 
   return new_middle;
+  #endif
 }
 
 // ------------------------------ Pivot
