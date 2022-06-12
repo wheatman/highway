@@ -28,10 +28,14 @@
 #endif
 
 #include <string.h>  // memcpy
+#include <iostream>
 
 #include "hwy/cache_control.h"  // Prefetch
 #include "hwy/contrib/sort/disabled_targets.h"
 #include "hwy/contrib/sort/vqsort.h"  // Fill24Bytes
+
+#include <cilk/cilk.h>
+#include "hwy/aligned_allocator.h"
 
 #if HWY_IS_MSAN
 #include <sanitizer/msan_interface.h>
@@ -418,6 +422,32 @@ HWY_NOINLINE size_t Partition(D d, Traits st, T* HWY_RESTRICT keys, size_t left,
   return writeL;
 }
 
+template <class D, class Traits, typename T>
+HWY_NOINLINE size_t Parallel_Partition(D d, Traits st, T *HWY_RESTRICT keys,
+                                       size_t left, size_t right,
+                                       const Vec<D> pivot,
+                                       T *HWY_RESTRICT buf) {
+  // return Partition(d, st, keys, left, right, pivot, buf);
+  if (right - left <= 10000) {
+    return Partition(d, st, keys, left, right, pivot, buf);
+  }
+
+  size_t middle = (right + left) / 2;
+  size_t left_break = cilk_spawn Parallel_Partition(d, st, keys, left, middle, pivot, buf);
+
+  HWY_ALIGN T extra_buf[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
+
+  size_t right_break = Parallel_Partition(d, st, keys, middle, right, pivot, extra_buf);
+  cilk_sync;
+  size_t new_middle = left_break + (right_break - middle);
+  size_t flip_point = (left_break + right_break)/2;
+  cilk_for (size_t i = left_break; i < flip_point; i++) {
+    std::swap(keys[i], keys[right_break+left_break - i - 1]);
+  }
+
+  return new_middle;
+}
+
 // ------------------------------ Pivot
 
 template <class Traits, class V>
@@ -672,6 +702,67 @@ void Recurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
             remaining_levels - 1);
   }
 }
+template <class D, class Traits, typename T>
+void PRecurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
+             const size_t end, const Vec<D> pivot, T* HWY_RESTRICT buf,
+             Generator& rng, size_t remaining_levels) {
+  HWY_DASSERT(begin + 1 < end);
+  const size_t num = end - begin;  // >= 2
+  if (num <= 10000) {
+    return Recurse(d, st, keys, begin, end, pivot, buf, rng, remaining_levels);
+  }
+
+  // Too many degenerate partitions. This is extremely unlikely to happen
+  // because we select pivots from large (though still O(1)) samples.
+  if (HWY_UNLIKELY(remaining_levels == 0)) {
+    HeapSort(st, keys + begin, num);  // Slow but N*logN.
+    return;
+  }
+
+  const ptrdiff_t base_case_num =
+      static_cast<ptrdiff_t>(Constants::BaseCaseNum(Lanes(d)));
+  const size_t bound = Parallel_Partition(d, st, keys, begin, end, pivot, buf);
+
+  const ptrdiff_t num_left =
+      static_cast<ptrdiff_t>(bound) - static_cast<ptrdiff_t>(begin);
+  const ptrdiff_t num_right =
+      static_cast<ptrdiff_t>(end) - static_cast<ptrdiff_t>(bound);
+
+  // Check for degenerate partitions (i.e. Partition did not move any keys):
+  if (HWY_UNLIKELY(num_right == 0)) {
+    // Because the pivot is one of the keys, it must have been equal to the
+    // first or last key in sort order. Scan for the actual min/max:
+    // passing the current pivot as the new bound is insufficient because one of
+    // the partitions might not actually include that key.
+    Vec<D> first, last;
+    ScanMinMax(d, st, keys + begin, num, buf, first, last);
+    if (AllTrue(d, Eq(first, last))) return;
+
+    // Separate recursion to make sure that we don't pick `last` as the
+    // pivot - that would again lead to a degenerate partition.
+    Recurse(d, st, keys, begin, end, first, buf, rng, remaining_levels - 1);
+    return;
+  }
+
+  cilk_spawn {
+    HWY_ALIGN T extra_buf[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
+    if (HWY_UNLIKELY(num_left <= base_case_num)) {
+    BaseCase(d, st, keys + begin, static_cast<size_t>(num_left), extra_buf);
+  } else {
+    const Vec<D> next_pivot = ChoosePivot(d, st, keys, begin, bound, extra_buf, rng);
+     Recurse(d, st, keys, begin, bound, next_pivot, extra_buf, rng,
+            remaining_levels - 1);
+  }
+  }
+  if (HWY_UNLIKELY(num_right <= base_case_num)) {
+    BaseCase(d, st, keys + bound, static_cast<size_t>(num_right), buf);
+  } else {
+    const Vec<D> next_pivot = ChoosePivot(d, st, keys, bound, end, buf, rng);
+    Recurse(d, st, keys, bound, end, next_pivot, buf, rng,
+            remaining_levels - 1);
+  }
+  cilk_sync;
+}
 
 // Returns true if sorting is finished.
 template <class D, class Traits, typename T>
@@ -759,6 +850,44 @@ void Sort(D d, Traits st, T* HWY_RESTRICT keys, size_t num,
   const size_t max_levels = 2 * hwy::CeilLog2(num) + 4;
 
   detail::Recurse(d, st, keys, 0, num, pivot, buf, rng, max_levels);
+#endif  // HWY_TARGET
+}
+template <class D, class Traits, typename T>
+void PSort(D d, Traits st, T* HWY_RESTRICT keys, size_t num,
+          T* HWY_RESTRICT buf) {
+#if HWY_TARGET == HWY_SCALAR || HWY_TARGET == HWY_EMU128
+  (void)d;
+  (void)buf;
+  // PERFORMANCE WARNING: vqsort is not enabled for the non-SIMD target
+  return detail::HeapSort(st, keys, num);
+#else
+#if !HWY_HAVE_SCALABLE
+  // On targets with fixed-size vectors, avoid _using_ the allocated memory.
+  // We avoid (potentially expensive for small input sizes) allocations on
+  // platforms where no targets are scalable. For 512-bit vectors, this fits on
+  // the stack (several KiB).
+  HWY_ALIGN T storage[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
+  static_assert(sizeof(storage) <= 8192, "Unexpectedly large, check size");
+  buf = storage;
+#endif  // !HWY_HAVE_SCALABLE
+
+  if (detail::HandleSpecialCases(d, st, keys, num, buf)) return;
+
+#if HWY_MAX_BYTES > 64
+  // sorting_networks-inl and traits assume no more than 512 bit vectors.
+  if (Lanes(d) > 64 / sizeof(T)) {
+    return PSort(CappedTag<T, 64 / sizeof(T)>(), st, keys, num, buf);
+  }
+#endif  // HWY_MAX_BYTES > 64
+
+  // Pulled out of the recursion so we can special-case degenerate partitions.
+  detail::Generator rng(keys, num);
+  const Vec<D> pivot = detail::ChoosePivot(d, st, keys, 0, num, buf, rng);
+
+  // Introspection: switch to worst-case N*logN heapsort after this many.
+  const size_t max_levels = 2 * hwy::CeilLog2(num) + 4;
+
+  detail::PRecurse(d, st, keys, 0, num, pivot, buf, rng, max_levels);
 #endif  // HWY_TARGET
 }
 

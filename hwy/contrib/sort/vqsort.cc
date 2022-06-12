@@ -134,8 +134,33 @@ Sorter::Sorter() {
   memset(ptr_, 0, max_bytes);
 #endif
 }
+PSorter::PSorter() {
+#if VQSORT_STACK
+  ptr_ = nullptr;  // Sort will use stack storage instead
+#else
+  // Determine the largest buffer size required for any type by trying them all.
+  // (The capping of N in BaseCaseNum means that smaller N but larger sizeof_t
+  // may require a larger buffer.)
+  const size_t vector_size = HWY_DYNAMIC_DISPATCH(VectorSize)();
+  const size_t max_bytes =
+      HWY_MAX(HWY_MAX(SortConstants::BufBytes<uint16_t>(vector_size),
+                      SortConstants::BufBytes<uint32_t>(vector_size)),
+              SortConstants::BufBytes<uint64_t>(vector_size));
+  ptr_ = hwy::AllocateAlignedBytes(max_bytes, nullptr, nullptr);
+
+  // Prevent msan errors by initializing.
+  memset(ptr_, 0, max_bytes);
+#endif
+}
 
 void Sorter::Delete() {
+#if !VQSORT_STACK
+  FreeAlignedBytes(ptr_, nullptr, nullptr);
+  ptr_ = nullptr;
+#endif
+}
+
+void PSorter::Delete() {
 #if !VQSORT_STACK
   FreeAlignedBytes(ptr_, nullptr, nullptr);
   ptr_ = nullptr;
@@ -174,9 +199,40 @@ void Sorter::Fill24Bytes(const void* seed_heap, size_t seed_num, void* bytes) {
   words[2] = bits_code ^ bits_time ^ seed_num;
 }
 
+void PSorter::Fill24Bytes(const void* seed_heap, size_t seed_num, void* bytes) {
+#if VQSORT_SECURE_SEED == 1
+  // May block if urandom is not yet initialized.
+  const ssize_t ret = getrandom(bytes, 24, /*flags=*/0);
+  if (ret == 24) return;
+#elif VQSORT_SECURE_SEED == 2
+  HCRYPTPROV hProvider{};
+  if (CryptAcquireContextA(&hProvider, nullptr, nullptr, PROV_RSA_FULL,
+                           CRYPT_VERIFYCONTEXT)) {
+    const BOOL ok =
+        CryptGenRandom(hProvider, 24, reinterpret_cast<BYTE*>(bytes));
+    CryptReleaseContext(hProvider, 0);
+    if (ok) return;
+  }
+#endif
+
+  // VQSORT_SECURE_SEED == 0, or one of the above failed. Get some entropy from
+  // stack/heap/code addresses and the clock() timer.
+  uint64_t* words = reinterpret_cast<uint64_t*>(bytes);
+  uint64_t** seed_stack = &words;
+  void (*seed_code)(const void*, size_t, void*) = &Fill24Bytes;
+  const uintptr_t bits_stack = reinterpret_cast<uintptr_t>(seed_stack);
+  const uintptr_t bits_heap = reinterpret_cast<uintptr_t>(seed_heap);
+  const uintptr_t bits_code = reinterpret_cast<uintptr_t>(seed_code);
+  const uint64_t bits_time = static_cast<uint64_t>(clock());
+  words[0] = bits_stack ^ bits_time ^ seed_num;
+  words[1] = bits_heap ^ bits_time ^ seed_num;
+  words[2] = bits_code ^ bits_time ^ seed_num;
+}
+
 #endif  // !VQSORT_SECURE_RNG
 
 bool Sorter::HaveFloat64() { return HWY_DYNAMIC_DISPATCH(HaveFloat64)(); }
+bool PSorter::HaveFloat64() { return HWY_DYNAMIC_DISPATCH(HaveFloat64)(); }
 
 }  // namespace hwy
 #endif  // HWY_ONCE

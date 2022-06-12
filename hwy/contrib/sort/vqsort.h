@@ -106,6 +106,65 @@ class HWY_CONTRIB_DLLEXPORT Sorter {
   void* ptr_ = nullptr;
 };
 
+class HWY_CONTRIB_DLLEXPORT PSorter {
+ public:
+  PSorter();
+  ~PSorter() { Delete(); }
+
+  // Move-only
+  PSorter(const PSorter&) = delete;
+  PSorter& operator=(const PSorter&) = delete;
+  PSorter(PSorter&& other) {
+    Delete();
+    ptr_ = other.ptr_;
+    other.ptr_ = nullptr;
+  }
+  PSorter& operator=(PSorter&& other) {
+    Delete();
+    ptr_ = other.ptr_;
+    other.ptr_ = nullptr;
+    return *this;
+  }
+
+  // Sorts keys[0, n). Dispatches to the best available instruction set,
+  // and does not allocate memory.
+  void operator()(uint16_t* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(uint16_t* HWY_RESTRICT keys, size_t n, SortDescending) const;
+  void operator()(uint32_t* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(uint32_t* HWY_RESTRICT keys, size_t n, SortDescending) const;
+  void operator()(uint64_t* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(uint64_t* HWY_RESTRICT keys, size_t n, SortDescending) const;
+
+  void operator()(int16_t* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(int16_t* HWY_RESTRICT keys, size_t n, SortDescending) const;
+  void operator()(int32_t* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(int32_t* HWY_RESTRICT keys, size_t n, SortDescending) const;
+  void operator()(int64_t* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(int64_t* HWY_RESTRICT keys, size_t n, SortDescending) const;
+
+  void operator()(float* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(float* HWY_RESTRICT keys, size_t n, SortDescending) const;
+  void operator()(double* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(double* HWY_RESTRICT keys, size_t n, SortDescending) const;
+
+  void operator()(uint128_t* HWY_RESTRICT keys, size_t n, SortAscending) const;
+  void operator()(uint128_t* HWY_RESTRICT keys, size_t n, SortDescending) const;
+
+  // For internal use only
+  static void Fill24Bytes(const void* seed_heap, size_t seed_num, void* bytes);
+  static bool HaveFloat64();
+
+ private:
+  void Delete();
+
+  template <typename T>
+  T* Get() const {
+    return static_cast<T*>(ptr_);
+  }
+
+  void* ptr_ = nullptr;
+};
+
 }  // namespace hwy
 
 #endif  // HIGHWAY_HWY_CONTRIB_SORT_VQSORT_H_

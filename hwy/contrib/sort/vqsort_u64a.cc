@@ -34,6 +34,12 @@ void SortU64Asc(uint64_t* HWY_RESTRICT keys, size_t num,
   detail::SharedTraits<detail::TraitsLane<detail::OrderAscending>> st;
   Sort(d, st, keys, num, buf);
 }
+void PSortU64Asc(uint64_t* HWY_RESTRICT keys, size_t num,
+                uint64_t* HWY_RESTRICT buf) {
+  SortTag<uint64_t> d;
+  detail::SharedTraits<detail::TraitsLane<detail::OrderAscending>> st;
+  PSort(d, st, keys, num, buf);
+}
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
 }  // namespace HWY_NAMESPACE
@@ -44,11 +50,16 @@ HWY_AFTER_NAMESPACE();
 namespace hwy {
 namespace {
 HWY_EXPORT(SortU64Asc);
+HWY_EXPORT(PSortU64Asc);
 }  // namespace
 
 void Sorter::operator()(uint64_t* HWY_RESTRICT keys, size_t n,
                         SortAscending) const {
   HWY_DYNAMIC_DISPATCH(SortU64Asc)(keys, n, Get<uint64_t>());
+}
+void PSorter::operator()(uint64_t* HWY_RESTRICT keys, size_t n,
+                        SortAscending) const {
+  HWY_DYNAMIC_DISPATCH(PSortU64Asc)(keys, n, Get<uint64_t>());
 }
 
 }  // namespace hwy

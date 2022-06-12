@@ -161,6 +161,7 @@ else()
     -Wsign-conversion
     -Wvla
     -Wnon-virtual-dtor
+    -fopencilk
   )
 
   if(${CMAKE_CXX_COMPILER_ID} MATCHES "Clang")
@@ -234,7 +235,7 @@ else()
 endif()  # !MSVC
 
 # By default prefer STATIC build (legacy behavior)
-option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
+option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 option(HWY_FORCE_STATIC_LIBS "Ignore BUILD_SHARED_LIBS" OFF)
 # only expose shared/static options to advanced users:
 mark_as_advanced(BUILD_SHARED_LIBS)
@@ -276,6 +277,7 @@ endif()
 if (HWY_ENABLE_CONTRIB)
 add_library(hwy_contrib ${HWY_LIBRARY_TYPE} ${HWY_CONTRIB_SOURCES})
 target_link_libraries(hwy_contrib hwy)
+target_link_options(hwy_contrib PUBLIC  -fopencilk)
 target_compile_options(hwy_contrib PRIVATE ${HWY_FLAGS})
 set_property(TARGET hwy_contrib PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(hwy_contrib PROPERTIES VERSION ${LIBRARY_VERSION} SOVERSION ${LIBRARY_SOVERSION})
