@@ -539,12 +539,12 @@ HWY_NOINLINE size_t Parallel_Partition(D d, Traits st, T *HWY_RESTRICT keys,
   }
 
   cilk_for(size_t i = 0; i < num_parts; i++) {
-    memcpy(keys + counts[i*8].first, lefts[i*8], (counts[(i+1)*8].first - counts[i*8].first) * sizeof(T));
-    memcpy(keys + counts[num_parts*8].first + counts[i*8].second, rights[i*8],  (counts[(i+1)*8].second - counts[i*8].second)  * sizeof(T));
+    memcpy(keys + left + counts[i*8].first, lefts[i*8], (counts[(i+1)*8].first - counts[i*8].first) * sizeof(T));
+    memcpy(keys + left + counts[num_parts*8].first + counts[i*8].second, rights[i*8],  (counts[(i+1)*8].second - counts[i*8].second)  * sizeof(T));
     FreeAlignedBytes(lefts[i*8], nullptr, nullptr);
     FreeAlignedBytes(rights[i*8], nullptr, nullptr);
   }
-  return counts[num_parts*8].first;
+  return left + counts[num_parts*8].first;
 #if false
   if (right - left <= 100000) {
     return Partition(d, st, keys, left, right, pivot, buf);
@@ -870,7 +870,7 @@ void Recurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
 template <class D, class Traits, typename T>
 void PRecurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
              const size_t end, const Vec<D> pivot, T* HWY_RESTRICT buf,
-             Generator& rng, size_t remaining_levels) {
+             Generator& rng, size_t remaining_levels, size_t current_level = 0) {
   HWY_DASSERT(begin + 1 < end);
   const size_t num = end - begin;  // >= 2
   if (num <= 10000) {
@@ -886,7 +886,12 @@ void PRecurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
 
   const ptrdiff_t base_case_num =
       static_cast<ptrdiff_t>(Constants::BaseCaseNum(Lanes(d)));
-  const size_t bound = Parallel_Partition(d, st, keys, begin, end, pivot, buf);
+  size_t bound;
+  if (current_level == 0){
+    bound = Parallel_Partition(d, st, keys, begin, end, pivot, buf);
+  } else {
+    bound = Partition(d, st, keys, begin, end, pivot, buf);
+  }
 
   const ptrdiff_t num_left =
       static_cast<ptrdiff_t>(bound) - static_cast<ptrdiff_t>(begin);
@@ -909,22 +914,24 @@ void PRecurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
     return;
   }
 
-  cilk_spawn {
-    HWY_ALIGN T extra_buf[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
-    if (HWY_UNLIKELY(num_left <= base_case_num)) {
-    BaseCase(d, st, keys + begin, static_cast<size_t>(num_left), extra_buf);
+  if (HWY_UNLIKELY(num_left <= base_case_num)) {
+    BaseCase(d, st, keys + begin, static_cast<size_t>(num_left), buf);
   } else {
-    const Vec<D> next_pivot = ChoosePivot(d, st, keys, begin, bound, extra_buf, rng);
-     Recurse(d, st, keys, begin, bound, next_pivot, extra_buf, rng,
-            remaining_levels - 1);
-  }
+    cilk_spawn {
+      HWY_ALIGN T extra_buf[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
+      const Vec<D> next_pivot =
+          ChoosePivot(d, st, keys, begin, bound, extra_buf, rng);
+      PRecurse(d, st, keys, begin, bound, next_pivot, extra_buf, rng,
+               remaining_levels - 1, current_level+1);
+    }
   }
   if (HWY_UNLIKELY(num_right <= base_case_num)) {
     BaseCase(d, st, keys + bound, static_cast<size_t>(num_right), buf);
   } else {
-    const Vec<D> next_pivot = ChoosePivot(d, st, keys, bound, end, buf, rng);
-    Recurse(d, st, keys, bound, end, next_pivot, buf, rng,
-            remaining_levels - 1);
+    HWY_ALIGN T extra_buf[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
+    const Vec<D> next_pivot = ChoosePivot(d, st, keys, bound, end, extra_buf, rng);
+    PRecurse(d, st, keys, bound, end, next_pivot, extra_buf, rng,
+             remaining_levels - 1, current_level+1);
   }
   cilk_sync;
 }
