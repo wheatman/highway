@@ -35,6 +35,7 @@
 #include "hwy/contrib/sort/vqsort.h"  // Fill24Bytes
 
 #include <cilk/cilk.h>
+#include <cilk/cilk_api.h>
 #include "hwy/aligned_allocator.h"
 
 #if HWY_IS_MSAN
@@ -316,6 +317,42 @@ HWY_INLINE void StoreLeftRight(D d, Traits st, const Vec<D> v,
 }
 
 template <class D, class Traits, typename T>
+HWY_INLINE void
+StoreLeftRight_external(D d, Traits st, const Vec<D> v, const Vec<D> pivot,
+                        T *HWY_RESTRICT left_out, T *HWY_RESTRICT right_out,
+                        std::pair<size_t, size_t> &counts) {
+  const size_t N = Lanes(d);
+
+  const auto comp = st.Compare(d, pivot, v);
+
+  if (hwy::HWY_NAMESPACE::CompressIsPartition<T>::value) {
+    // Non-native Compress (e.g. AVX2): we are able to partition a vector using
+    // a single Compress+two StoreU instead of two Compress[Blended]Store. The
+    // latter are more expensive. Because we store entire vectors, the contents
+    // between the updated writeL and writeR are ignored and will be overwritten
+    // by subsequent calls. This works because writeL and writeR are at least
+    // two vectors apart.
+    const auto lr = CompressNot(v, comp);
+    const size_t num_right = CountTrue(d, comp);
+    const size_t num_left = N - num_right;
+    StoreU(lr, d, left_out + counts.first);
+    counts.first += num_left;
+    // Now write the right-side elements (if any), such that the previous writeR
+    // is one past the end of the newly written right elements, then advance.
+    StoreU(Reverse(d, lr), d, right_out + counts.second);
+    counts.second += num_right;
+  } else {
+    // Native Compress[Store] (e.g. AVX3), which only keep the left or right
+    // side, not both, hence we require two calls.
+    const size_t num_left = CompressStore(v, Not(comp), d, left_out + counts.first);
+    counts.first += num_left;
+
+    (void)CompressBlendedStore(v, comp, d, right_out + counts.second);
+    counts.second += (N - num_left);
+  }
+}
+
+template <class D, class Traits, typename T>
 HWY_INLINE void StoreLeftRight4(D d, Traits st, const Vec<D> v0,
                                 const Vec<D> v1, const Vec<D> v2,
                                 const Vec<D> v3, const Vec<D> pivot,
@@ -325,6 +362,18 @@ HWY_INLINE void StoreLeftRight4(D d, Traits st, const Vec<D> v0,
   StoreLeftRight(d, st, v1, pivot, keys, writeL, writeR);
   StoreLeftRight(d, st, v2, pivot, keys, writeL, writeR);
   StoreLeftRight(d, st, v3, pivot, keys, writeL, writeR);
+}
+
+template <class D, class Traits, typename T>
+HWY_INLINE void StoreLeftRight_external4(D d, Traits st, const Vec<D> v0,
+                                const Vec<D> v1, const Vec<D> v2,
+                                const Vec<D> v3, const Vec<D> pivot,
+                                T* HWY_RESTRICT left_out, T* HWY_RESTRICT right_out,
+                                std::pair<size_t, size_t>& counts) {
+  StoreLeftRight_external(d, st, v0, pivot, left_out, right_out, counts);
+  StoreLeftRight_external(d, st, v1, pivot, left_out, right_out, counts);
+  StoreLeftRight_external(d, st, v2, pivot, left_out, right_out, counts);
+  StoreLeftRight_external(d, st, v3, pivot, left_out, right_out, counts);
 }
 
 // Moves "<= pivot" keys to the front, and others to the back. pivot is
@@ -423,12 +472,80 @@ HWY_NOINLINE size_t Partition(D d, Traits st, T* HWY_RESTRICT keys, size_t left,
 }
 
 template <class D, class Traits, typename T>
+HWY_NOINLINE std::pair<size_t, size_t> Parallel_External_Buffer(D d, Traits st,
+                                             T *HWY_RESTRICT keys, size_t left,
+                                             size_t right, const Vec<D> pivot,
+                                             T *HWY_RESTRICT left_out,
+                                             T *HWY_RESTRICT right_out) {
+  using V = decltype(Zero(d));
+  constexpr size_t kUnroll = Constants::kPartitionUnroll;
+  const size_t N = Lanes(d);
+  const size_t num_per_iter = kUnroll*N;
+  size_t aligned_count = ((right - left)/num_per_iter)*num_per_iter;
+  std::pair<size_t, size_t> counts = {0, 0};
+  for (size_t i = 0; i < aligned_count; i+=num_per_iter) {
+        V v0 = LoadU(d, keys + left + i + 0 * N);
+        V v1 = LoadU(d, keys + left + i + 1 * N);
+        V v2 = LoadU(d, keys + left + i + 2 * N);
+        V v3 = LoadU(d, keys + left + i + 3 * N);
+        StoreLeftRight_external4(d, st, v0, v1, v2, v3, pivot, left_out, right_out, counts);
+  }
+  T p = GetLane(pivot);
+  for (size_t i = aligned_count; i < right - left; i += 1) {
+    if (keys[left + i] <= p) {
+      left_out[counts.first] = keys[left + i];
+      counts.first += 1;
+    } else {
+      right_out[counts.second] = keys[left + i];
+      counts.second += 1;
+    }
+  }
+  return counts;
+}
+
+template <class D, class Traits, typename T>
 HWY_NOINLINE size_t Parallel_Partition(D d, Traits st, T *HWY_RESTRICT keys,
                                        size_t left, size_t right,
                                        const Vec<D> pivot,
-                                       T *HWY_RESTRICT buf) {
-  return Partition(d, st, keys, left, right, pivot, buf);
-  #if false
+                                       [[maybe_unused]] T *HWY_RESTRICT buf) {
+  // return Partition(d, st, keys, left, right, pivot, buf);
+  if (right - left <= 100000) {
+    return Partition(d, st, keys, left, right, pivot, buf);
+  }
+  size_t num_parts = __cilkrts_get_nworkers() * 10;
+
+  std::vector<T*> lefts(num_parts * 8);
+  std::vector<T*> rights(num_parts * 8);
+  std::vector<std::pair<size_t, size_t>> counts((num_parts + 1) * 8);
+  size_t region_length = right - left;
+  size_t part_length = region_length / num_parts;
+  cilk_for(size_t i = 0; i < num_parts; i++) {
+    size_t start = left + (part_length * i);
+    size_t end = left + (part_length *(i+1));
+    if ( i == num_parts - 1) {
+      end = right;
+    }
+    lefts[i * 8] = (T * HWY_RESTRICT)
+        hwy::AllocateAlignedBytes((end - start) * sizeof(T), nullptr, nullptr);
+    rights[i * 8] = (T * HWY_RESTRICT)
+        hwy::AllocateAlignedBytes((end - start) * sizeof(T), nullptr, nullptr);
+    counts[(i + 1) * 8] = Parallel_External_Buffer(
+        d, st, keys, start, end, pivot, lefts[i * 8], rights[i * 8]);
+  }
+
+  for (size_t i = 1; i < num_parts+1; i++) {
+    counts[i * 8].first += counts[(i - 1) * 8].first;
+    counts[i * 8].second += counts[(i - 1) * 8].second;
+  }
+
+  cilk_for(size_t i = 0; i < num_parts; i++) {
+    memcpy(keys + counts[i*8].first, lefts[i*8], (counts[(i+1)*8].first - counts[i*8].first) * sizeof(T));
+    memcpy(keys + counts[num_parts*8].first + counts[i*8].second, rights[i*8],  (counts[(i+1)*8].second - counts[i*8].second)  * sizeof(T));
+    FreeAlignedBytes(lefts[i*8], nullptr, nullptr);
+    FreeAlignedBytes(rights[i*8], nullptr, nullptr);
+  }
+  return counts[num_parts*8].first;
+#if false
   if (right - left <= 100000) {
     return Partition(d, st, keys, left, right, pivot, buf);
   }
