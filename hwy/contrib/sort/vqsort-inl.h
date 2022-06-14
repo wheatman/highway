@@ -507,55 +507,20 @@ template <class D, class Traits, typename T>
 HWY_NOINLINE size_t Parallel_Partition(D d, Traits st, T *HWY_RESTRICT keys,
                                        size_t left, size_t right,
                                        const Vec<D> pivot,
-                                       [[maybe_unused]] T *HWY_RESTRICT buf) {
+                                       [[maybe_unused]] T *HWY_RESTRICT buf, size_t level = 0) {
   // return Partition(d, st, keys, left, right, pivot, buf);
-  if (right - left <= 100000) {
-    return Partition(d, st, keys, left, right, pivot, buf);
-  }
-  size_t num_parts = __cilkrts_get_nworkers() * 10;
 
-  std::vector<T*> lefts(num_parts * 8);
-  std::vector<T*> rights(num_parts * 8);
-  std::vector<std::pair<size_t, size_t>> counts((num_parts + 1) * 8);
-  size_t region_length = right - left;
-  size_t part_length = region_length / num_parts;
-  cilk_for(size_t i = 0; i < num_parts; i++) {
-    size_t start = left + (part_length * i);
-    size_t end = left + (part_length *(i+1));
-    if ( i == num_parts - 1) {
-      end = right;
-    }
-    lefts[i * 8] = (T * HWY_RESTRICT)
-        hwy::AllocateAlignedBytes((end - start) * sizeof(T), nullptr, nullptr);
-    rights[i * 8] = (T * HWY_RESTRICT)
-        hwy::AllocateAlignedBytes((end - start) * sizeof(T), nullptr, nullptr);
-    counts[(i + 1) * 8] = Parallel_External_Buffer(
-        d, st, keys, start, end, pivot, lefts[i * 8], rights[i * 8]);
-  }
-
-  for (size_t i = 1; i < num_parts+1; i++) {
-    counts[i * 8].first += counts[(i - 1) * 8].first;
-    counts[i * 8].second += counts[(i - 1) * 8].second;
-  }
-
-  cilk_for(size_t i = 0; i < num_parts; i++) {
-    memcpy(keys + left + counts[i*8].first, lefts[i*8], (counts[(i+1)*8].first - counts[i*8].first) * sizeof(T));
-    memcpy(keys + left + counts[num_parts*8].first + counts[i*8].second, rights[i*8],  (counts[(i+1)*8].second - counts[i*8].second)  * sizeof(T));
-    FreeAlignedBytes(lefts[i*8], nullptr, nullptr);
-    FreeAlignedBytes(rights[i*8], nullptr, nullptr);
-  }
-  return left + counts[num_parts*8].first;
-#if false
-  if (right - left <= 100000) {
+// #if false
+  if (right - left <= 100000 || level > 2) {
     return Partition(d, st, keys, left, right, pivot, buf);
   }
 
   size_t middle = (right + left) / 2;
-  size_t left_break = cilk_spawn Parallel_Partition(d, st, keys, left, middle, pivot, buf);
+  size_t left_break = cilk_spawn Parallel_Partition(d, st, keys, left, middle, pivot, buf, level+1);
 
   HWY_ALIGN T extra_buf[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
 
-  size_t right_break = Parallel_Partition(d, st, keys, middle, right, pivot, extra_buf);
+  size_t right_break = Parallel_Partition(d, st, keys, middle, right, pivot, extra_buf, level+1);
   cilk_sync;
   size_t new_middle = left_break + (right_break - middle);
   size_t flip_point = (left_break + right_break)/2;
@@ -610,7 +575,7 @@ HWY_NOINLINE size_t Parallel_Partition(D d, Traits st, T *HWY_RESTRICT keys,
   }
 
   return new_middle;
-  #endif
+  // #endif
 }
 
 // ------------------------------ Pivot
@@ -870,10 +835,10 @@ void Recurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
 template <class D, class Traits, typename T>
 void PRecurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
              const size_t end, const Vec<D> pivot, T* HWY_RESTRICT buf,
-             Generator& rng, size_t remaining_levels, size_t current_level = 0) {
+             Generator& rng, size_t remaining_levels, size_t level = 0) {
   HWY_DASSERT(begin + 1 < end);
   const size_t num = end - begin;  // >= 2
-  if (num <= 10000) {
+  if (num <= 10000 || level > 8) {
     return Recurse(d, st, keys, begin, end, pivot, buf, rng, remaining_levels);
   }
 
@@ -886,12 +851,7 @@ void PRecurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
 
   const ptrdiff_t base_case_num =
       static_cast<ptrdiff_t>(Constants::BaseCaseNum(Lanes(d)));
-  size_t bound;
-  if (current_level == 0){
-    bound = Parallel_Partition(d, st, keys, begin, end, pivot, buf);
-  } else {
-    bound = Partition(d, st, keys, begin, end, pivot, buf);
-  }
+  const size_t bound = Parallel_Partition(d, st, keys, begin, end, pivot, buf, level);
 
   const ptrdiff_t num_left =
       static_cast<ptrdiff_t>(bound) - static_cast<ptrdiff_t>(begin);
@@ -922,16 +882,15 @@ void PRecurse(D d, Traits st, T* HWY_RESTRICT keys, const size_t begin,
       const Vec<D> next_pivot =
           ChoosePivot(d, st, keys, begin, bound, extra_buf, rng);
       PRecurse(d, st, keys, begin, bound, next_pivot, extra_buf, rng,
-               remaining_levels - 1, current_level+1);
+               remaining_levels - 1, level+1);
     }
   }
   if (HWY_UNLIKELY(num_right <= base_case_num)) {
     BaseCase(d, st, keys + bound, static_cast<size_t>(num_right), buf);
   } else {
-    HWY_ALIGN T extra_buf[SortConstants::BufNum<T>(HWY_LANES(T))] = {};
-    const Vec<D> next_pivot = ChoosePivot(d, st, keys, bound, end, extra_buf, rng);
-    PRecurse(d, st, keys, bound, end, next_pivot, extra_buf, rng,
-             remaining_levels - 1, current_level+1);
+    const Vec<D> next_pivot = ChoosePivot(d, st, keys, bound, end, buf, rng);
+    PRecurse(d, st, keys, bound, end, next_pivot, buf, rng,
+             remaining_levels - 1, level+1);
   }
   cilk_sync;
 }
